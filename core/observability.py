@@ -1,0 +1,547 @@
+"""
+core/observability.py — Structured logging and optional OpenTelemetry tracing.
+
+This module provides two capabilities that are essential for running the
+agent pipeline in production:
+
+1. **Structured JSON logging** via ``python-json-logger``.  When enabled,
+   every log record is emitted as a single JSON line containing timestamp,
+   level, logger name, message, and all ``extra`` fields — ready for
+   ingestion by ELK, Datadog, or any structured-log sink.
+
+2. **OpenTelemetry tracing** (optional).  When the ``opentelemetry-sdk``
+   package is installed and ``OTEL_ENABLED=true``, a tracer provider is
+   configured with an OTLP exporter.  The module exposes a thin ``Tracer``
+   wrapper so callers can create spans without importing OTel directly.
+
+Both features degrade gracefully: if the optional packages are not
+installed, standard ``logging`` and no-op tracing are used instead.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import functools
+import importlib.util
+import logging
+import os
+import time
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
+from typing import Any, TypeVar
+
+# ---------------------------------------------------------------------------
+# Request ID context variable — propagates request_id through async call chains
+# ---------------------------------------------------------------------------
+
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default=""
+)
+
+
+def set_request_id(request_id: str) -> None:
+    """Set the current request ID in the context variable."""
+    _request_id_var.set(request_id)
+
+
+def get_request_id() -> str:
+    """Return the current request ID, or empty string if not set."""
+    return _request_id_var.get()
+
+
+class RequestIdFilter(logging.Filter):
+    """Inject request_id into every log record from the context variable."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = get_request_id()  # type: ignore[attr-defined]
+        return True
+
+
+class SanitizingFilter(logging.Filter):
+    """Redact sensitive keys in log record extras before serialisation.
+
+    Delegates to ``core.security.sanitize_log_data`` which recursively
+    strips passwords, tokens, API keys, and URLs with embedded credentials.
+    """
+
+    _PROTECTED_ATTRS = frozenset(
+        {
+            "name",
+            "msg",
+            "args",
+            "created",
+            "relativeCreated",
+            "exc_info",
+            "exc_text",
+            "stack_info",
+            "lineno",
+            "funcName",
+            "pathname",
+            "filename",
+            "module",
+            "levelno",
+            "levelname",
+            "message",
+            "msecs",
+            "process",
+            "processName",
+            "thread",
+            "threadName",
+            "request_id",
+            "taskName",
+        }
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from core.security import sanitize_log_data
+
+        extras = {
+            k: getattr(record, k)
+            for k in list(record.__dict__)
+            if not k.startswith("_") and k not in self._PROTECTED_ATTRS
+        }
+        if extras:
+            sanitized = sanitize_log_data(extras)
+            for k, v in sanitized.items():
+                setattr(record, k, v)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Structured JSON logging
+# ---------------------------------------------------------------------------
+
+
+def configure_logging(level: str = "INFO") -> None:
+    """Configure the root logger with structured JSON output if available.
+
+    Falls back to the standard ``%(asctime)s`` text format when
+    ``python-json-logger`` is not installed.
+
+    Args:
+        level: Python log level name (``DEBUG``, ``INFO``, …).
+    """
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    if root.handlers:
+        for handler in root.handlers[:]:
+            root.removeHandler(handler)
+
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+
+    try:
+        from pythonjsonlogger.json import JsonFormatter
+
+        formatter = JsonFormatter(
+            fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+            rename_fields={"asctime": "timestamp", "levelname": "level"},
+        )
+    except ImportError:
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    handler.setFormatter(formatter)
+    handler.addFilter(RequestIdFilter())
+    handler.addFilter(SanitizingFilter())
+    root.addHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry tracing (optional)
+# ---------------------------------------------------------------------------
+
+_tracer: Any | None = None
+try:
+    _OTEL_AVAILABLE = importlib.util.find_spec("opentelemetry.sdk.trace") is not None
+except ModuleNotFoundError:
+    _OTEL_AVAILABLE = False
+
+
+def init_tracing(service_name: str = "langgraph-agent-stack") -> None:
+    """Initialise the OpenTelemetry tracer provider.
+
+    This is a no-op when ``opentelemetry-sdk`` is not installed or
+    ``OTEL_ENABLED`` is not set to a truthy value.
+
+    Args:
+        service_name: The ``service.name`` resource attribute.
+    """
+    global _tracer
+
+    if not _OTEL_AVAILABLE:
+        logging.getLogger(__name__).debug(
+            "OpenTelemetry SDK not installed — tracing disabled"
+        )
+        return
+
+    otel_enabled = os.getenv("OTEL_ENABLED", "false").lower() in ("1", "true", "yes")
+    if not otel_enabled:
+        logging.getLogger(__name__).debug("OTEL_ENABLED is not set — tracing disabled")
+        return
+
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    resource = Resource.create({"service.name": service_name})
+    provider = TracerProvider(resource=resource)
+
+    otlp_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    otel_insecure = os.getenv("OTEL_EXPORTER_OTLP_INSECURE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    is_local = "localhost" in otlp_endpoint or "127.0.0.1" in otlp_endpoint
+    if otel_insecure or is_local:
+        exporter = OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True)
+    else:
+        exporter = OTLPSpanExporter(endpoint=otlp_endpoint)
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+
+    trace.set_tracer_provider(provider)
+    _tracer = trace.get_tracer(service_name)
+
+    logging.getLogger(__name__).info(
+        "OpenTelemetry tracing enabled",
+        extra={"endpoint": otlp_endpoint, "service": service_name},
+    )
+
+
+def instrument_fastapi_app(app: Any) -> bool:
+    """Instrument ``app`` so every HTTP request produces a root OTel span.
+
+    Without this, ``trace_span()`` calls inside pack nodes (``research_node``,
+    ``analysis_node``, ...) still create spans, but each one arrives at the
+    collector as a disconnected root — there is no request span to nest under,
+    so you cannot tell which HTTP call a node belongs to, what status it
+    returned, or how node time compares to total request latency.
+
+    No-op when ``init_tracing()`` did not actually enable tracing (missing
+    OTel SDK, or ``OTEL_ENABLED`` unset/false) or when the optional
+    ``opentelemetry-instrumentation-fastapi`` package is not installed, so the
+    ``observability`` extra stays fully optional. Probe endpoints
+    (``/health``, ``/ready``, ``/metrics``) are excluded so they do not flood
+    the collector with span noise. Safe to call more than once — the
+    instrumentor tracks instrumented apps itself and skips re-instrumenting.
+
+    Args:
+        app: The FastAPI application instance to instrument.
+
+    Returns:
+        True if instrumentation was applied, False otherwise.
+    """
+    if _tracer is None:
+        return False
+
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "opentelemetry-instrumentation-fastapi not installed — "
+            "request-level tracing disabled"
+        )
+        return False
+
+    FastAPIInstrumentor().instrument_app(app, excluded_urls="/health,/ready,/metrics")
+    logging.getLogger(__name__).info(
+        "FastAPI request tracing instrumented — pack node spans now nest "
+        "under the request span"
+    )
+    return True
+
+
+def set_span_attributes(attributes: dict[str, Any]) -> None:
+    """Attach attributes (e.g. ``pack_id``, ``run_id``) to the current span.
+
+    Targets whatever span is active in the ambient context — typically the
+    request span created by :func:`instrument_fastapi_app`. No-op when OTel
+    is unavailable or no span is currently recording, so call sites do not
+    need to guard this themselves.
+
+    Args:
+        attributes: Key-value pairs to attach to the current span.
+    """
+    if not _OTEL_AVAILABLE:
+        return
+
+    from opentelemetry import trace
+
+    span = trace.get_current_span()
+    if span is None or not span.is_recording():
+        return
+    for key, value in attributes.items():
+        span.set_attribute(key, value)
+
+
+class _NoOpTracer:
+    """Minimal stub so callers can use ``tracer.start_as_current_span``."""
+
+    @contextmanager
+    def start_as_current_span(
+        self, name: str, **kwargs: Any
+    ) -> Generator[None, None, None]:
+        yield
+
+
+_NOOP_TRACER = _NoOpTracer()
+
+
+def get_tracer() -> Any:
+    """Return the active OTel tracer, or a no-op stub."""
+    if _tracer is not None:
+        return _tracer
+    if _OTEL_AVAILABLE:
+        from opentelemetry import trace
+
+        return trace.get_tracer("langgraph-agent-stack")
+
+    return _NOOP_TRACER
+
+
+@contextmanager
+def trace_span(
+    name: str, attributes: dict[str, Any] | None = None
+) -> Generator[Any, None, None]:
+    """Context manager that wraps a block in an OTel span.
+
+    Attributes are attached if the span is real.  When OTel is disabled the
+    block executes with zero overhead.
+
+    Args:
+        name: Span name (e.g. ``"research_node"``).
+        attributes: Optional key-value pairs attached to the span.
+
+    Yields:
+        The active span, or ``None`` when tracing is disabled.
+    """
+    tracer = get_tracer()
+    with tracer.start_as_current_span(name) as span:
+        if attributes and hasattr(span, "set_attribute"):
+            for k, v in attributes.items():
+                span.set_attribute(k, v)
+        yield span
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+
+# pack_run_cost_usd_total Counter is defined in core/cost.py to avoid circular imports
+
+# Optional Prometheus metrics — ``None`` when ``prometheus-client`` is not installed.
+http_requests_total: Any | None = None
+http_request_duration_seconds: Any | None = None
+llm_requests_total: Any | None = None
+llm_request_duration_seconds: Any | None = None
+llm_tokens_total: Any | None = None
+active_pipelines: Any | None = None
+server_shutting_down: Any | None = None
+requests_rejected_during_shutdown: Any | None = None
+llm_retry_attempts_total: Any | None = None
+agent_node_duration_seconds: Any | None = None
+output_guard_findings_total: Any | None = None
+pack_runs_total: Any | None = None
+pack_run_duration_seconds: Any | None = None
+_PROMETHEUS_AVAILABLE = False
+
+# HTTP latency spans sub-second health checks through long SSE streams (STREAM_TIMEOUT_SECONDS).
+_HTTP_DURATION_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
+# LLM calls routinely exceed 30s on analysis workloads.
+_LLM_DURATION_BUCKETS = (0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0)
+# Graph nodes typically wrap one or more LLM calls — same upper range applies.
+_NODE_DURATION_BUCKETS = _LLM_DURATION_BUCKETS
+
+
+def metrics_path_label(scope: Mapping[str, Any]) -> str:
+    """Return the matched route template for Prometheus ``path`` labels.
+
+    Uses the FastAPI/Starlette route pattern (e.g. ``/packs/{pack_id}/run``)
+    rather than the concrete URL path so session/pack/run IDs do not explode
+    metric cardinality.
+
+    Args:
+        scope: ASGI scope from ``request.scope``.
+
+    Returns:
+        Route template path, or ``"unknown"`` when no route matched.
+    """
+    from fastapi.routing import APIRoute
+
+    route = scope.get("route")
+    if isinstance(route, APIRoute):
+        return route.path
+    path = getattr(route, "path", None)
+    if isinstance(path, str) and path:
+        return path
+    return "unknown"
+
+
+try:
+    from prometheus_client import (
+        Counter,
+        Gauge,
+        Histogram,
+        make_asgi_app,
+    )
+
+    http_requests_total = Counter(
+        "http_requests_total",
+        "Total HTTP requests",
+        ["method", "path", "status_code"],
+    )
+    http_request_duration_seconds = Histogram(
+        "http_request_duration_seconds",
+        "HTTP request duration in seconds",
+        ["path"],
+        buckets=list(_HTTP_DURATION_BUCKETS),
+    )
+    llm_requests_total = Counter(
+        "llm_requests_total",
+        "Total LLM API calls",
+        ["provider", "status"],
+    )
+    llm_request_duration_seconds = Histogram(
+        "llm_request_duration_seconds",
+        "LLM API call duration in seconds",
+        ["provider"],
+        buckets=list(_LLM_DURATION_BUCKETS),
+    )
+    llm_tokens_total = Counter(
+        "llm_tokens_total",
+        "Total tokens consumed by LLM calls",
+        ["provider", "direction"],
+    )
+    active_pipelines = Gauge(
+        "active_pipelines",
+        "Currently running agent pipelines",
+    )
+    server_shutting_down = Gauge(
+        "server_shutting_down",
+        "1 when the server is draining and rejecting new requests, 0 otherwise",
+    )
+    requests_rejected_during_shutdown = Counter(
+        "requests_rejected_during_shutdown_total",
+        "Requests rejected with 503 because the server is shutting down",
+    )
+    llm_retry_attempts_total = Counter(
+        "llm_retry_attempts_total",
+        "LLM retry attempts: outcome='success' counts each retry performed "
+        "after a transient error, outcome='exhausted' counts retry budgets "
+        "that were fully consumed without recovery",
+        ["provider", "outcome"],
+    )
+    agent_node_duration_seconds = Histogram(
+        "agent_node_duration_seconds",
+        "Wall-clock duration of one agent graph node execution in seconds",
+        ["agent", "node"],
+        buckets=list(_NODE_DURATION_BUCKETS),
+    )
+    output_guard_findings_total = Counter(
+        "output_guard_findings_total",
+        "Output integrity guard events: action='audit' counts outputs with "
+        "findings logged for review, action='fail_closed' counts outputs "
+        "rejected by the fail-closed policy",
+        ["pack_id", "action"],
+    )
+    # Pack-run wall duration reuses HTTP buckets (sub-second through SSE timeout).
+    pack_runs_total = Counter(
+        "pack_runs_total",
+        "Pack runs by pack, version, and outcome",
+        ["pack_id", "version", "outcome"],
+    )
+    pack_run_duration_seconds = Histogram(
+        "pack_run_duration_seconds",
+        "Pack run wall duration in seconds",
+        ["pack_id", "version", "outcome"],
+        buckets=list(_HTTP_DURATION_BUCKETS),
+    )
+
+    def create_metrics_app() -> Any:
+        """Return ASGI app for /metrics endpoint."""
+        return make_asgi_app()
+
+    _PROMETHEUS_AVAILABLE = True
+
+except ImportError:
+
+    def create_metrics_app() -> Any:
+        """No-op when prometheus-client is not installed."""
+        return None
+
+
+def outcome_from_http_status(status_code: int) -> str:
+    """Map an HTTP status code to a low-cardinality pack-run outcome label."""
+    if 200 <= status_code < 300:
+        return "success"
+    if status_code == 402:
+        return "budget_exceeded"
+    if 400 <= status_code < 500:
+        return "client_error"
+    return "server_error"
+
+
+def record_pack_run(
+    pack_id: str,
+    version: str,
+    outcome: str,
+    duration_seconds: float,
+) -> None:
+    """Increment pack-run counters and observe wall duration (no-op without Prometheus)."""
+    if pack_runs_total is None or pack_run_duration_seconds is None:
+        return
+    labels = {
+        "pack_id": pack_id or "unknown",
+        "version": version or "unknown",
+        "outcome": outcome,
+    }
+    pack_runs_total.labels(**labels).inc()
+    pack_run_duration_seconds.labels(**labels).observe(duration_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Agent node timing decorator
+# ---------------------------------------------------------------------------
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def timed_node(agent_name: str, node_name: str) -> Callable[[_F], _F]:
+    """Decorator that records graph-node duration in ``agent_node_duration_seconds``.
+
+    Labels are static strings supplied at decoration time (agent class name and
+    node name), so metric cardinality stays bounded.  When ``prometheus-client``
+    is not installed the wrapped function runs with zero overhead and its
+    return value / exceptions are passed through unchanged.
+
+    Currently applied to ``AnalystAgent`` nodes; other agents (e.g.
+    ``ResearchAgent``) can adopt it by decorating their node methods the same
+    way.
+
+    Args:
+        agent_name: Low-cardinality agent identifier (e.g. ``"AnalystAgent"``).
+        node_name: Graph node name (e.g. ``"analyze"``).
+
+    Returns:
+        A decorator preserving the wrapped callable's signature and result.
+    """
+
+    def decorator(func: _F) -> _F:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if agent_node_duration_seconds is None:
+                return func(*args, **kwargs)
+            start = time.monotonic()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                agent_node_duration_seconds.labels(
+                    agent=agent_name, node=node_name
+                ).observe(time.monotonic() - start)
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator

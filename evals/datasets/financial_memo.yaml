@@ -1,0 +1,34 @@
+# Golden dataset — financial_memo sample/demo pack.
+# Scripted JSON only. Not a measure of financial quality.
+cases:
+  - id: sample_expansion_memo
+    input:
+      topic: "Sample expansion memo"
+      hypothesis: "A second warehouse pays back inside two years."
+      metrics: "Illustrative figures only: revenue 10, margin 20 percent."
+      time_horizon: "12 months"
+    mock_responses:
+      - |
+        {
+          "topic": "Sample expansion memo",
+          "situation": "The sample case assumes one warehouse at capacity.",
+          "complications": ["Illustrative demand is uneven."],
+          "options": ["Wait", "Lease a second site"],
+          "recommendation": "Treat this as a demo narrative, not a decision.",
+          "risks": ["Figures are fictional."],
+          "next_steps": ["Replace the sample numbers before any real use."],
+          "confidence": 0.7
+        }
+    checks:
+      required_fields:
+        - topic
+        - situation
+        - recommendation
+        - disclaimer
+        - human_review_required
+      contains:
+        topic: "Sample expansion"
+        disclaimer: "SAMPLE/DEMO"
+        recommendation: "demo"
+      numeric_range:
+        confidence: [0.0, 1.0]

@@ -1,0 +1,29 @@
+# Golden dataset — meeting_prep pack.
+# Scripted JSON only. No network, no API key.
+cases:
+  - id: acme_discovery
+    input:
+      company: Acme
+      person: Jane
+      meeting_goal: discovery
+    mock_responses:
+      - |
+        {
+          "company": "Acme",
+          "person": "Jane",
+          "company_overview": "Acme builds industrial sensors.",
+          "recent_news": ["Acme opened a pilot plant."],
+          "talking_points": ["Ask about the pilot plant timeline.", "Confirm the buying committee."],
+          "questions_to_ask": ["Who owns the budget?"],
+          "landmines": ["Do not assume a signed timeline."],
+          "confidence": 0.8
+        }
+    checks:
+      required_fields: [company, talking_points, questions_to_ask, landmines, confidence]
+      min_length:
+        talking_points: 2
+      contains:
+        company: "Acme"
+        talking_points: "pilot"
+      numeric_range:
+        confidence: [0.5, 1.0]

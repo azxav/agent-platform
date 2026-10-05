@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------------------
+# Example variable values for each cloud provider
+#
+# Prefer the ready-made environment files in environments/:
+#
+#   environments/eks.dev.tfvars     environments/eks.prod.tfvars
+#   environments/gke.dev.tfvars     environments/gke.prod.tfvars
+#   environments/azure.dev.tfvars   environments/azure.prod.tfvars
+#
+# Copy a section below only if you need a custom terraform.tfvars in the
+# matching entry-point directory (gke/, eks/, or aks/).
+# ---------------------------------------------------------------------------
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GKE  (cd infra/terraform/gke && terraform init && terraform apply)
+# ═══════════════════════════════════════════════════════════════════════════
+# project_id   = "my-gcp-project"
+# region       = "us-central1"
+# cluster_name = "langgraph-cluster"
+# environment  = "dev"
+# namespace    = "langgraph-agents"
+# llm_provider = "anthropic"
+# # REQUIRED to reach the GKE control plane: the default is an empty list, so
+# # provide your own CIDRs (e.g. office/VPN egress ranges).
+# master_authorized_cidrs = [{
+#   cidr_block   = "203.0.113.0/24"
+#   display_name = "office"
+# }]
+# # API keys: populate GCP Secret Manager after apply (see terraform output populate_secrets_commands).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EKS  (cd infra/terraform/eks && terraform init && terraform apply)
+# ═══════════════════════════════════════════════════════════════════════════
+# aws_region         = "us-east-1"
+# cluster_name       = "langgraph-cluster"
+# environment        = "dev"
+# namespace          = "langgraph-agents"
+# llm_provider       = "anthropic"
+# eks_version        = "1.31"
+# node_instance_type = "t3.medium"
+# node_min_size      = 1
+# node_max_size      = 3
+# node_desired_size  = 2
+# # Set via TF_VAR_anthropic_api_key or -var:
+# # anthropic_api_key = ""
+# # redis_url         = ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AKS  (cd infra/terraform/aks && terraform init && terraform apply)
+# ═══════════════════════════════════════════════════════════════════════════
+# subscription_id     = "00000000-0000-0000-0000-000000000000"
+# resource_group_name = "langgraph-rg"
+# location            = "canadaeast"
+# cluster_name        = "langgraph-cluster"
+# environment         = "dev"
+# kubernetes_version  = "1.29"
+# node_count          = 2
+# node_vm_size        = "Standard_D2s_v3"
+# namespace           = "langgraph-agents"
+# llm_provider        = "anthropic"
+# # Set via TF_VAR_anthropic_api_key or -var:
+# # anthropic_api_key = ""
+# # redis_url         = ""

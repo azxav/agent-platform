@@ -1,0 +1,14 @@
+apiVersion: v2
+name: langgraph-agent-stack
+description: Portfolio agent platform (FastAPI + LangGraph packs). Chart adapted from Brescou/langgraph-agent-stack (MIT).
+type: application
+version: 0.8.0
+appVersion: "0.1.0"
+keywords:
+  - langgraph
+  - fastapi
+  - ai
+  - portfolio
+maintainers:
+  - name: azxav
+    url: https://github.com/azxav
