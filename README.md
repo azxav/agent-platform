@@ -1,10 +1,12 @@
 # agent-platform
 
-I built a small multi-agent platform I can run with no API key.
+Personal project by **Azizbek** ([azxav](https://github.com/azxav)).
 
-I serve LangGraph domain packs from FastAPI, as JSON or as Server-Sent Events. A pack registry picks the workflow. I cap each run in USD. If a request repeats the same `Idempotency-Key`, I replay the first response. My golden-dataset evals and the test suite both run against a deterministic mock model.
+A small multi-agent platform that runs with no API key.
 
-`financial_memo` is a sample/demo memo. I leave the HR and legal packs disabled (HTTP 403). This is not a bank system, not a hiring system, and not legal tech.
+FastAPI serves LangGraph domain packs as JSON or as Server-Sent Events. A pack registry picks the workflow. Each run is capped in USD. If a request repeats the same `Idempotency-Key`, the first response is replayed. Golden-dataset evals and the test suite both run against a deterministic mock model.
+
+`financial_memo` is a sample/demo memo. HR and legal packs stay disabled (HTTP 403). This is not a bank system, not a hiring system, and not legal tech.
 
 ## Packs
 
@@ -12,9 +14,9 @@ I serve LangGraph domain packs from FastAPI, as JSON or as Server-Sent Events. A
 |------|--------|------|
 | `research_analysis` | `POST /run` and `POST /packs/research_analysis/run` | Default: research, then analysis |
 | `meeting_prep` | `POST /packs/meeting_prep/run` | Meeting brief |
-| `financial_memo` | `POST /packs/financial_memo/run` | Sample/demo strategy memo. I inject the disclaimer server-side |
+| `financial_memo` | `POST /packs/financial_memo/run` | Sample/demo strategy memo. The disclaimer is applied server-side |
 
-I also register other productivity packs (`summariser`, `executive_brief`, `support_triage`, `rfp_assistant`) and the research phase splits so the kernel and evals have more than one shape. They are supporting examples.
+Other productivity packs (`summariser`, `executive_brief`, `support_triage`, `rfp_assistant`) and the research phase splits stay registered so the kernel and evals have more than one shape. They are supporting examples.
 
 HR (`talent_screening`, `job_description_writer`, `hr_policy_qa`) and legal (`contract_reviewer`) stay in the tree behind `REGULATED_PACKS_ENABLED=false`. A valid body returns **403**. Turning the flag on does not make them compliant.
 
@@ -62,7 +64,7 @@ curl -s -X POST http://localhost:8000/packs/financial_memo/run \
 
 Interactive docs: `http://localhost:8000/docs` (off when `ENVIRONMENT=production`).
 
-A real provider is optional. Set `LLM_PROVIDER` to `anthropic`, `openai`, `google`, `bedrock`, `azure`, or `ollama`, install the matching extra (`uv sync --extra anthropic`, and so on), and supply that provider's key. OpenRouter is only the generic `OPENAI_BASE_URL` override if you point the OpenAI client at a gateway. I do not configure it here.
+A real provider is optional. Set `LLM_PROVIDER` to `anthropic`, `openai`, `google`, `bedrock`, `azure`, or `ollama`, install the matching extra (`uv sync --extra anthropic`, and so on), and supply that provider's key. OpenRouter is only the generic `OPENAI_BASE_URL` override if you point the OpenAI client at a gateway. It is not configured here.
 
 ## Architecture
 
@@ -99,7 +101,7 @@ flowchart LR
 
 `core/graph.py` is a compatibility shim onto `research_analysis`.
 
-`GET /packs` and `GET /packs/{id}/versions` list the versions I registered. `X-Pack-Version` pins one. Weights split traffic.
+`GET /packs` and `GET /packs/{id}/versions` list registered versions. `X-Pack-Version` pins one. Weights split traffic.
 
 ## API
 
@@ -134,7 +136,7 @@ make eval-ci  # same gate as CI: JSON plus evals/thresholds.yaml
 
 `LLM_PROVIDER=mock` is the default. CI and `make eval` do not need a provider key.
 
-Datasets I ship today: `research_analysis`, `meeting_prep`, `financial_memo`, `summariser`, and `talent_screening` (the last one checks the fail-closed guard). `evals/datasets/*.yaml` replay scripted model output through the real pack code. `make eval` prints the pass counts. Those numbers are structural (schema, fields, guards). I do not treat the pass rate as a quality score for a live model.
+Datasets that ship today: `research_analysis`, `meeting_prep`, `financial_memo`, `summariser`, and `talent_screening` (the last one checks the fail-closed guard). `evals/datasets/*.yaml` replay scripted model output through the real pack code. `make eval` prints the pass counts. Those numbers are structural (schema, fields, guards). The pass rate is not a quality score for a live model.
 
 ## Docker and Helm
 
