@@ -1,0 +1,176 @@
+replicaCount: 1  # SQLite supports only a single writer. Use redis or postgres to scale out.
+
+image:
+  repository: langgraph-agent-stack
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: nginx
+  host: langgraph.example.com
+  tls: false
+
+resources:
+  requests:
+    memory: 256Mi
+    cpu: 250m
+  limits:
+    memory: 512Mi
+    cpu: 500m
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  # Scaling backend — LLM workloads are I/O-bound; CPU stays low while pods are saturated.
+  #   keda              — recommended: KEDA Prometheus trigger on active_pipelines gauge
+  #   active_pipelines  — HPA external metric (requires prometheus-adapter; see examples/)
+  #   cpu               — NOT recommended: mis-scales on concurrent LLM calls
+  metric: keda
+  targetCPUUtilizationPercentage: 80  # only when metric=cpu
+  prometheus:
+    metricName: active_pipelines
+    # Target avg concurrent pipelines per pod (~0.75–0.9 × THREAD_POOL_MAX_WORKERS)
+    averageValue: "3"
+
+# KEDA ScaledObject (used when autoscaling.enabled=true and autoscaling.metric=keda).
+# Prerequisites: KEDA installed in cluster + Prometheus scraping /metrics (serviceMonitor.enabled).
+keda:
+  prometheusServerAddress: http://prometheus-operated.monitoring.svc:9090
+  # Scale up when avg active_pipelines per pod exceeds this (default THREAD_POOL_MAX_WORKERS=4)
+  activePipelinesThreshold: "3"
+  # Override PromQL if your scrape labels differ; default uses pod name prefix match
+  activePipelinesQuery: ""
+  pollingInterval: 30
+  cooldownPeriod: 300
+
+config:
+  logLevel: INFO
+  # Default development so a bare `helm install` starts without API_KEY.
+  # Production overlays (values.prod.yaml) set environment: production.
+  environment: development
+  # WARNING: sqlite with emptyDir loses all data on pod restart.
+  # Use redis or postgres for durable persistence in production.
+  memoryBackend: sqlite
+  sqlitePath: /app/data/memory.db
+  maxTokens: "4096"
+  rateLimitBackend: "memory"  # "redis" required for multi-replica (shares state across pods)
+  # In-flight run registry (409 dedup per session_id). "redis" is required
+  # for multi-replica deployments, otherwise the lock only holds within a
+  # single pod.
+  sessionRegistryBackend: "memory"
+  # Behind an Ingress/LB: enable proxy trust so the rate limiter uses the
+  # real client IP (X-Forwarded-For) instead of the load balancer's IP.
+  trustProxyHeaders: false
+  # CIDRs of trusted proxies (Ingress controller, ALB, GCP LB, etc.).
+  # RFC1918 example — adjust to your cluster's pod/service network CIDR.
+  forwardedAllowIps: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+# PersistentVolume for /app/data (default sqlitePath).  With memoryBackend=sqlite,
+# this stores both checkpoints and run history.  With redis/postgres, checkpoints
+# live in the external service but run history still uses SQLite at sqlitePath —
+# enable persistence here if you need that audit trail across pod restarts; with
+# persistence.enabled=false, emptyDir is expected (run history is ephemeral).
+persistence:
+  enabled: true
+  mountPath: /app/data
+  size: 1Gi
+  storageClass: ""
+  accessMode: ReadWriteOnce
+
+llm:
+  provider: mock
+  anthropicModel: claude-sonnet-5
+  openaiModel: gpt-5.5
+  googleModel: gemini-3.5-flash
+  awsRegion: us-east-1
+  bedrockModel: anthropic.claude-sonnet-5
+  ollamaBaseUrl: http://localhost:11434
+  ollamaModel: llama3.2
+
+secrets:
+  existingSecret: ""
+  anthropicApiKey: ""
+  openaiApiKey: ""
+  googleApiKey: ""
+  redisUrl: ""
+  # Inbound API authentication (Bearer). Leave both empty to disable auth
+  # (dev only — at least one key is required when config.environment=production).
+  # apiKey: legacy single shared secret (API_KEY env var).
+  # apiKeys: comma-separated multi-tenant key list (API_KEYS env var) —
+  #   any listed key is accepted; use it for per-tenant keys and zero-downtime
+  #   rotation (list old + new keys during the transition).
+  # In production prefer secrets.existingSecret with API_KEY / API_KEYS
+  # provisioned via ESO / Sealed Secrets / SOPS (see templates/secret.yaml).
+  apiKey: ""
+  apiKeys: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # GKE Workload Identity (set by Terraform on the pre-created SA):
+  #   iam.gke.io/gcp-service-account: langgraph-dev@PROJECT_ID.iam.gserviceaccount.com
+  # IRSA / EKS Pod Identity — bind an IAM role; do NOT mount static AWS keys:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/langgraph-bedrock
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+livenessProbe:
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+readinessProbe:
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+networkPolicy:
+  enabled: false
+  ingressNamespaceLabel: {}
+  extraEgressRules: []
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # Alternative to minAvailable — use one or the other (prod uses maxUnavailable).
+  maxUnavailable: ""
+
+# Spread pods across failure domains (requires topology labels on nodes).
+# Disabled by default (single-replica dev). Enable for multi-replica prod so
+# replicas are not stacked on the same node/AZ.
+topologySpreadConstraints:
+  enabled: false
+  constraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+namespace:
+  create: true
+  name: langgraph-agents
+
+serviceMonitor:
+  enabled: false
+  namespace: monitoring
+  interval: 30s
+
+# Grace period must exceed STREAM_TIMEOUT_SECONDS so in-flight SSE streams
+# finish before Kubernetes kills the pod.  120s (stream timeout) + 30s buffer.
+terminationGracePeriodSeconds: 150

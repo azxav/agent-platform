@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# GKE module variables
+# ---------------------------------------------------------------------------
+
+variable "project_id" {
+  description = "GCP project ID."
+  type        = string
+}
+
+variable "region" {
+  description = "GCP region for the GKE Autopilot cluster."
+  type        = string
+  default     = "us-central1"
+}
+
+variable "cluster_name" {
+  description = "Name of the GKE Autopilot cluster (created in the root module)."
+  type        = string
+}
+
+variable "environment" {
+  description = "Deployment environment (dev or prod)."
+  type        = string
+  default     = "dev"
+
+  validation {
+    condition     = contains(["dev", "prod"], var.environment)
+    error_message = "environment must be 'dev' or 'prod'."
+  }
+}
+
+variable "namespace" {
+  description = "Kubernetes namespace for the langgraph-agent-stack."
+  type        = string
+  default     = "langgraph-agents"
+}
+
+variable "helm_chart_path" {
+  description = "Path to the langgraph-agent-stack Helm chart directory."
+  type        = string
+}
+
+variable "llm_provider" {
+  description = "LLM provider name. Portfolio default is mock (no API key)."
+  type        = string
+  default     = "mock"
+}
+
+variable "helm_values_files" {
+  description = "Overrides the default Helm overlay list entirely. Empty = derive from environment."
+  type        = list(string)
+  default     = []
+}
+
+variable "image_repository" {
+  description = "Optional override for image.repository (empty = use values.cloud.yaml)."
+  type        = string
+  default     = ""
+}
+
+variable "image_tag" {
+  description = "Optional override for image.tag (empty = Chart.AppVersion via omitted tag)."
+  type        = string
+  default     = ""
+}
+

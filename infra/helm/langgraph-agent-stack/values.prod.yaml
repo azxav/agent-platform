@@ -1,0 +1,52 @@
+replicaCount: 3
+
+image:
+  pullPolicy: Always
+
+config:
+  environment: production
+  memoryBackend: redis
+  rateLimitBackend: "redis"  # share rate-limit state across replicas
+  sessionRegistryBackend: "redis"  # share in-flight session locks across replicas
+  trustProxyHeaders: true
+  forwardedAllowIps: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+resources:
+  requests:
+    memory: 512Mi
+    cpu: 500m
+  limits:
+    memory: 1Gi
+    cpu: 1000m
+
+autoscaling:
+  enabled: true
+  metric: keda
+  maxReplicas: 10
+
+keda:
+  prometheusServerAddress: http://prometheus-operated.monitoring.svc:9090
+  activePipelinesThreshold: "3"
+
+serviceMonitor:
+  enabled: true
+
+persistence:
+  enabled: false  # prod utilise Redis ou Postgres
+
+networkPolicy:
+  enabled: true
+
+topologySpreadConstraints:
+  enabled: true
+  constraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1  # at most one voluntary eviction during node drain / cluster upgrade
+
+secrets:
+  existingSecret: langgraph-secrets

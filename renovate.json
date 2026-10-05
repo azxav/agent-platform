@@ -1,0 +1,5 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabled": false,
+  "description": "Renovate disabled in favour of Dependabot (.github/dependabot.yml) \u2014 grouped weekly updates, one bot only."
+}
