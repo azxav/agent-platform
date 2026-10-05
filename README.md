@@ -1,38 +1,22 @@
 # agent-platform
 
-Personal portfolio project by **Azizbek** ([azxav](https://github.com/azxav)): a small multi-agent platform you can run with **no API key**.
+I built a small multi-agent platform I can run with no API key.
 
-FastAPI serves LangGraph domain packs over JSON and Server-Sent Events. A pack registry picks the workflow. Each run can be capped in USD. Repeating a request with the same `Idempotency-Key` replays the first response. Golden-dataset evals and the test suite both run against a deterministic mock model.
+I serve LangGraph domain packs from FastAPI, as JSON or as Server-Sent Events. A pack registry picks the workflow. I cap each run in USD. If a request repeats the same `Idempotency-Key`, I replay the first response. My golden-dataset evals and the test suite both run against a deterministic mock model.
 
-Scaffold inspired by Brescou/langgraph-agent-stack (MIT).
+`financial_memo` is a sample/demo memo. I leave the HR and legal packs disabled (HTTP 403). This is not a bank system, not a hiring system, and not legal tech.
 
-Suggested GitHub description: `Portfolio agent platform — FastAPI, LangGraph packs, mock LLM, per-run cost caps, golden evals.`
-
-Suggested topics: `langgraph` `fastapi` `python` `llm` `agents` `sse` `prometheus` `portfolio`
-
-## What a recruiter should notice
-
-- **Mock first.** `LLM_PROVIDER=mock` is the default. CI and `make eval` do not need a provider key.
-- **Per-run cost caps.** A pack run that would pass `PACK_DEFAULT_BUDGET_USD` returns **HTTP 402** before it keeps spending.
-- **Pack versions and canary weights.** `GET /packs` and `GET /packs/{id}/versions` expose registered versions. `X-Pack-Version` pins one. Weights split traffic.
-- **Idempotency.** `Idempotency-Key` caches a completed pack response. The same key with a different body returns **409**.
-- **Golden evals.** `evals/datasets/*.yaml` replay scripted model output through the real pack code. `make eval` prints the pass counts. Those numbers are structural (schema, fields, guards), not a claim about model quality.
-- **Tests.** `make test` is the suite. Counts in this README are whatever the last local run printed — see the pull request for the latest figure.
-- **Prometheus.** `GET /metrics` is wired when the `observability` extra is installed. Grafana dashboard JSON ships under `infra/grafana/dashboards/` (cost, latency, pack versions).
-
-This is not a bank system, not a hiring system, and not legal tech. `financial_memo` is a **sample/demo** memo. HR and legal packs stay **disabled** (HTTP 403) and are not products.
-
-## Packs to try
+## Packs
 
 | Pack | Route | Role |
 |------|--------|------|
 | `research_analysis` | `POST /run` and `POST /packs/research_analysis/run` | Default: research, then analysis |
 | `meeting_prep` | `POST /packs/meeting_prep/run` | Meeting brief |
-| `financial_memo` | `POST /packs/financial_memo/run` | Sample/demo strategy memo. Disclaimer is injected server-side |
+| `financial_memo` | `POST /packs/financial_memo/run` | Sample/demo strategy memo. I inject the disclaimer server-side |
 
-Other productivity packs (`summariser`, `executive_brief`, `support_triage`, `rfp_assistant`) and the research phase splits stay registered so the kernel and evals have more than one shape. They are supporting examples, not the story.
+I also register other productivity packs (`summariser`, `executive_brief`, `support_triage`, `rfp_assistant`) and the research phase splits so the kernel and evals have more than one shape. They are supporting examples.
 
-HR (`talent_screening`, `job_description_writer`, `hr_policy_qa`) and legal (`contract_reviewer`) remain in the tree behind `REGULATED_PACKS_ENABLED=false`. A valid body returns **403**. Setting the flag does not make them compliant.
+HR (`talent_screening`, `job_description_writer`, `hr_policy_qa`) and legal (`contract_reviewer`) stay in the tree behind `REGULATED_PACKS_ENABLED=false`. A valid body returns **403**. Turning the flag on does not make them compliant.
 
 ## Run it (mock, no key)
 
@@ -78,7 +62,7 @@ curl -s -X POST http://localhost:8000/packs/financial_memo/run \
 
 Interactive docs: `http://localhost:8000/docs` (off when `ENVIRONMENT=production`).
 
-A real provider is optional and later. Set `LLM_PROVIDER` to `anthropic`, `openai`, `google`, `bedrock`, `azure`, or `ollama`, install the matching extra (`uv sync --extra anthropic`, and so on), and supply that provider's key. OpenRouter is only the generic `OPENAI_BASE_URL` override if you choose to point the OpenAI client at a gateway. It is not configured here.
+A real provider is optional. Set `LLM_PROVIDER` to `anthropic`, `openai`, `google`, `bedrock`, `azure`, or `ollama`, install the matching extra (`uv sync --extra anthropic`, and so on), and supply that provider's key. OpenRouter is only the generic `OPENAI_BASE_URL` override if you point the OpenAI client at a gateway. I do not configure it here.
 
 ## Architecture
 
@@ -115,7 +99,9 @@ flowchart LR
 
 `core/graph.py` is a compatibility shim onto `research_analysis`.
 
-## API (the parts that matter)
+`GET /packs` and `GET /packs/{id}/versions` list the versions I registered. `X-Pack-Version` pins one. Weights split traffic.
+
+## API
 
 | Method | Path | What it does |
 |--------|------|----------------|
@@ -127,6 +113,8 @@ flowchart LR
 | `GET` | `/metrics` | Prometheus, after `uv sync --extra observability` |
 
 Budget overrun: **402**. Idempotency clash: **409**. Disabled HR/legal pack: **403**. Bad body: **422**.
+
+The same `Idempotency-Key` caches a completed pack response. The same key with a different body returns **409**.
 
 ## Cost cap
 
@@ -144,7 +132,9 @@ make eval     # golden datasets, scripted responses, pass/fail printed by the ha
 make eval-ci  # same gate as CI: JSON plus evals/thresholds.yaml
 ```
 
-Datasets that ship today include `research_analysis`, `meeting_prep`, `financial_memo`, `summariser`, and `talent_screening` (the last one checks the fail-closed guard, not a hiring product). Do not treat the pass rate as a quality score for a live model.
+`LLM_PROVIDER=mock` is the default. CI and `make eval` do not need a provider key.
+
+Datasets I ship today: `research_analysis`, `meeting_prep`, `financial_memo`, `summariser`, and `talent_screening` (the last one checks the fail-closed guard). `evals/datasets/*.yaml` replay scripted model output through the real pack code. `make eval` prints the pass counts. Those numbers are structural (schema, fields, guards). I do not treat the pass rate as a quality score for a live model.
 
 ## Docker and Helm
 
@@ -161,16 +151,12 @@ Prometheus and Grafana:
 docker compose -f infra/docker-compose.yml --profile observability up --build
 ```
 
-Helm chart (directory name kept from the scaffold): `infra/helm/langgraph-agent-stack`. `values.yaml` sets `llm.provider` to `mock`.
+`GET /metrics` is wired when the `observability` extra is installed. Dashboard JSON is under `infra/grafana/dashboards/` (cost, latency, pack versions).
+
+Helm chart: `infra/helm/langgraph-agent-stack`. `values.yaml` sets `llm.provider` to `mock`.
 
 ```bash
 helm lint infra/helm/langgraph-agent-stack
 ```
 
-Terraform under `infra/terraform/` is an unused stub from the scaffold. It is not required to run the demo, and it is not a multi-cloud production setup.
-
-## License
-
-MIT. Original copyright: langgraph-agent-stack contributors. Portfolio adaptations: Azizbek (azxav).
-
-Scaffold inspired by Brescou/langgraph-agent-stack (MIT).
+MIT. Upstream: [Brescou/langgraph-agent-stack](https://github.com/Brescou/langgraph-agent-stack).
