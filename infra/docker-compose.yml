@@ -1,0 +1,137 @@
+# docker-compose.yml — Local development environment
+#
+# Usage:
+#   Standard (SQLite backend):
+#     docker compose up
+#
+#   With Redis backend:
+#     docker compose --profile redis up
+#
+# Prerequisites:
+#   cp .env.example .env
+#   The example defaults to LLM_PROVIDER=mock (no API key).
+
+
+services:
+  # ---------------------------------------------------------------------------
+  # Application service
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+      args:
+        OBS_EXTRAS: observability
+    image: langgraph-agent-stack:local
+    container_name: langgraph-app
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    env_file:
+      - ../.env
+    environment:
+      # Ensure the app can write SQLite data to the mounted volume
+      SQLITE_PATH: /app/data/memory.db
+      RAG_PERSIST_DIR: /app/data/rag
+    volumes:
+      # Persist SQLite database across container restarts
+      - sqlite-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - langgraph-net
+
+  # ---------------------------------------------------------------------------
+  # Redis service — optional, activate with: --profile redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: langgraph-redis
+    restart: unless-stopped
+    profiles:
+      - redis
+    ports:
+      - "6379:6379"
+    command:
+      - sh
+      - -c
+      - |
+        if [ -z "$$REDIS_PASSWORD" ]; then
+          echo "ERROR: REDIS_PASSWORD is required when using the redis compose profile. Set it in .env or export it before starting." >&2
+          exit 1
+        fi
+        exec redis-server --save 60 1 --loglevel warning --requirepass "$$REDIS_PASSWORD"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "REDISCLI_AUTH=$${REDIS_PASSWORD} redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - langgraph-net
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: langgraph-prometheus
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - langgraph-net
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: langgraph-grafana
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - langgraph-net
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  sqlite-data:
+    driver: local
+  redis-data:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  langgraph-net:
+    driver: bridge

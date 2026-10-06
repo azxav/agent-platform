@@ -1,0 +1,79 @@
+# Dependabot — automated dependency update PRs
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+#
+# Covers:
+#   - uv / pyproject.toml + uv.lock (grouped PRs)
+#   - GitHub Actions workflows (.github/workflows/)
+#   - Docker base images (infra/Dockerfile)
+#   - Docker Compose images (redis, prometheus, grafana in infra/)
+
+version: 2
+updates:
+  # ── Python (uv lockfile) ───────────────────────────────────────────────────
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 10
+    groups:
+      langchain-ecosystem:
+        patterns:
+          - langchain*
+          - langgraph*
+          - langsmith*
+      python-app:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - langchain*
+          - langgraph*
+          - langsmith*
+      dev-dependencies:
+        dependency-type: development
+        patterns:
+          - "*"
+
+  # ── GitHub Actions ─────────────────────────────────────────────────────────
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+
+  # ── Docker (python:3.12.x-slim builder + runtime stages) ─────────────────
+  - package-ecosystem: docker
+    directory: /infra
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 3
+    groups:
+      docker-base-images:
+        patterns:
+          - "*"
+
+  # ── Docker Compose (redis, prometheus, grafana) ──────────────────────────
+  - package-ecosystem: docker-compose
+    directory: /infra
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: UTC
+    open-pull-requests-limit: 3
+    groups:
+      compose-images:
+        patterns:
+          - "*"

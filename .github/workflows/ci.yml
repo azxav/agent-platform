@@ -1,0 +1,430 @@
+# ci.yml — Continuous Integration pipeline for langgraph-agent-stack
+#
+# Jobs:
+#   lint         — ruff (lint + import sort + format check)
+#   typecheck    — pyright basic type checking
+#   infra-lint   — helm lint, terraform validate, checkov, kubeconform, kube-linter
+#   test         — pytest with coverage via uv
+#   evals        — mock-mode pack eval gate (structural regressions)
+#   docker-smoke — local image build + /health startup validation (PR + main)
+#   integration  — real backend tests (Postgres/Redis via testcontainers)
+#   publish      — GHCR push + Syft SBOM + Cosign keyless sign (main + v* tags; not a build test)
+#
+# All Python dependency installation uses uv exclusively (no pip, no poetry).
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  # Cancel in-progress runs for the same branch/PR to save runner minutes
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  UV_VERSION: "0.11.18"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ---------------------------------------------------------------------------
+# Job 1 — Lint
+# ---------------------------------------------------------------------------
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install dev dependencies
+        run: uv sync --frozen
+
+      - name: Run ruff (lint + import sort)
+        run: uv run ruff check .
+
+      - name: Run ruff (format check)
+        run: uv run ruff format --check .
+
+# ---------------------------------------------------------------------------
+# Job 2 — Typecheck
+# ---------------------------------------------------------------------------
+  typecheck:
+    name: Typecheck (pyright)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          # Shared with the pytest --all-extras job: ~/.cache/uv is a
+          # content-addressed package cache (not the project venv), so no
+          # extras discriminator is required to avoid cross-job pollution.
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install all dependencies (including extras + dev)
+        run: uv sync --frozen --all-extras
+
+      - name: Run pyright
+        run: uv run pyright
+
+# ---------------------------------------------------------------------------
+# Job 3 — Infra DevSecOps (Helm, Terraform, K8s policy)
+# ---------------------------------------------------------------------------
+  infra-lint:
+    name: Infra DevSecOps (Helm + Terraform + K8s)
+    runs-on: ubuntu-latest
+    env:
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform.d/plugin-cache
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e  # v4.0.1
+
+      - name: Terraform plugin cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tf-plugins-${{ runner.os }}-${{ hashFiles('infra/terraform/**/.terraform.lock.hcl', 'infra/terraform/**/versions.tf') }}
+          restore-keys: |
+            tf-plugins-${{ runner.os }}-
+
+      - name: Terraform fmt check (all)
+        run: terraform -chdir=infra/terraform fmt -check -recursive
+
+      - name: Terraform validate modules and entry points
+        run: |
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          for dir in \
+            infra/terraform/modules/*/ \
+            infra/terraform/eks \
+            infra/terraform/gke \
+            infra/terraform/aks
+          do
+            echo "--- terraform validate $dir ---"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+      - name: Install Checkov
+        run: uv tool install "checkov==3.2.440"
+
+      - name: Infra DevSecOps (checkov, kubeconform, kube-linter)
+        run: bash scripts/infra-devsecops.sh
+
+# ---------------------------------------------------------------------------
+# Job 4 — Test
+# ---------------------------------------------------------------------------
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    env:
+      # Provide a dummy key so pydantic-settings validation passes for unit tests
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'test-key-not-real' }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Cache uv dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install all dependencies (including dev)
+        run: uv sync --frozen --all-extras
+
+      - name: Guard — observability extra present
+        run: uv run python -c "import prometheus_client"
+
+      - name: Run pytest with coverage
+        run: |
+          uv run pytest \
+            --cov \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: coverage-report-${{ matrix.python-version }}
+          path: coverage.xml
+          retention-days: 7
+
+# ---------------------------------------------------------------------------
+# Job 4a — Pack evals (mock mode structural gate)
+# ---------------------------------------------------------------------------
+  evals:
+    name: Pack evals (mock)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    env:
+      LLM_PROVIDER: mock
+      SEARCH_PROVIDER: mock
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run mock pack evals against thresholds
+        run: >
+          uv run python -m evals --all --json
+          --thresholds evals/thresholds.yaml
+
+# ---------------------------------------------------------------------------
+# Job 4b — README quickstart smoke (COUPLED TO README.md BY DESIGN)
+# ---------------------------------------------------------------------------
+  readme-smoke:
+    name: README quickstart smoke
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Run README quickstart verbatim
+        run: bash scripts/readme-smoke.sh
+
+# ---------------------------------------------------------------------------
+# Job 5 — Docker smoke test (build + startup validation)
+# ---------------------------------------------------------------------------
+  docker-smoke:
+    name: Docker smoke test
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    env:
+      ANTHROPIC_API_KEY: test-key-not-real
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Run smoke test (build + /health + /docs + non-root)
+        run: bash tests/smoke_test_docker.sh
+
+# ---------------------------------------------------------------------------
+# Job 6 — Integration tests (real backends via testcontainers)
+# ---------------------------------------------------------------------------
+  integration:
+    name: Integration tests (Postgres / Redis)
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    env:
+      ANTHROPIC_API_KEY: test-key-not-real
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v8.3.2 (SHA verified)
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Cache uv dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-integration-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-integration-
+
+      - name: Install dependencies with backend extras
+        run: uv sync --frozen --extra redis --extra postgres
+
+      - name: Run integration tests
+        run: uv run pytest -m integration --tb=short -v
+
+# ---------------------------------------------------------------------------
+# Job 7 — Publish to GHCR + supply chain (main + v* tags)
+# Not a build smoke test — that is docker-smoke. This job only runs after
+# smoke passes and publishes a signed, SBOM-attached image to the registry.
+# ---------------------------------------------------------------------------
+  publish:
+    name: Publish container image (GHCR)
+    runs-on: ubuntu-latest
+    needs: [test, docker-smoke]
+    # Only run on push to main or version tags — not on pull requests
+    if: |
+      github.event_name == 'push' && (
+        github.ref == 'refs/heads/main' ||
+        startsWith(github.ref, 'refs/tags/v')
+      )
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # Cosign keyless signing via GitHub OIDC → Sigstore
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Normalise image reference (GHCR requires lowercase)
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Docker layers
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-${{ runner.os }}-${{ hashFiles('infra/Dockerfile', 'pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            buildx-${{ runner.os }}-
+
+      - name: Extract image metadata (OCI labels + tags)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=,format=long
+            type=semver,pattern={{version}}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: infra/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      # Rotate the cache to prevent unbounded growth
+      - name: Rotate Buildx cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Generate SBOM (Syft / SPDX)
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26  # v0.24.2
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: Attach SBOM to image
+        run: |
+          cosign attach sbom --sbom sbom.spdx.json \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+
+      - name: Sign container image (Cosign keyless OIDC)
+        run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: container-sbom-spdx
+          path: sbom.spdx.json
+          retention-days: 90
